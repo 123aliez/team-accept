@@ -349,17 +349,12 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                 if not email_lines:
                     return self._json({"error": "所有邮箱均注册失败，无可用账号"}, 400)
 
-        extract_token = body.get("extract_token", True)
         fetch_session = body.get("fetch_session", True)
 
         if task_type == "register":
             cmd = [sys.executable, str(work_dir / "register_accounts.py")]
             if len(email_lines) == 1:
                 cmd += ["--email", email_lines[0].split("----")[0].strip()]
-            if not extract_token:
-                cmd += ["--no-token"]
-            if not fetch_session:
-                cmd += ["--no-session"]
         elif task_type == "accept":
             cmd = [sys.executable, str(work_dir / "accept_invite.py")]
             if len(email_lines) == 1:
@@ -646,12 +641,8 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
       </div>
       <div style="display:flex;gap:16px;margin-top:8px;padding-left:2px">
         <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;user-select:none">
-          <input type="checkbox" id="extract-token" checked style="width:16px;height:16px;cursor:pointer">
-          注册后提取个人Token
-        </label>
-        <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;user-select:none">
           <input type="checkbox" id="fetch-session" checked style="width:16px;height:16px;cursor:pointer">
-          注册后导出Session
+          登录后导出Session
         </label>
       </div>
     </div>
@@ -737,13 +728,12 @@ async function runTask(type) {
   const emails = document.getElementById('shared-emails').value.trim();
   const proxies = document.getElementById('shared-proxies').value.trim();
   const workers = document.getElementById('shared-workers').value;
-  const extract_token = document.getElementById('extract-token').checked;
   const fetch_session = document.getElementById('fetch-session').checked;
   const proxy_proto = document.getElementById('proxy-proto').value;
   const res = await api('/api/run/' + type, {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({emails, workers, proxies, extract_token, fetch_session, proxy_proto})
+    body: JSON.stringify({emails, workers, proxies, fetch_session, proxy_proto})
   });
   currentTaskId = res.task_id;
   document.getElementById('live-output').textContent = '任务已启动: ' + res.task_id + '\n';
@@ -840,9 +830,8 @@ async function loadTokenResults() {
       regHtml += '<div style="font-size:12px;color:var(--text2);margin-bottom:6px">' + codexRegs.length + ' 个注册记录</div>';
       for (const r of codexRegs) {
         const ok = r.registered || r.otp_validated;
-        const tokenTag = r.token_extracted ? ' <span style="color:var(--green);font-size:11px">🎫 Token已提取</span>' : '';
         regHtml += `<div class="result-item ${ok?'success':'fail'}">
-          <div class="r-email ${ok?'ok':'fail'}">${ok?'✅':'❌'} ${r.email||r._filename}${tokenTag}</div>
+          <div class="r-email ${ok?'ok':'fail'}">${ok?'✅':'❌'} ${r.email||r._filename}</div>
           ${r.registration_method?`<div class="r-info">方式: ${r.registration_method}</div>`:''}
           ${!ok && r._raw?`<div class="r-info" style="color:var(--red)">${r._raw}</div>`:''}
         </div>`;
