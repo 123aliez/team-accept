@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+output/
+proxy-chains/
+*.log
+.env
+emails.txt
+proxies.txt
+config.json
