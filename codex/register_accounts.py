@@ -33,9 +33,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def derive_password(email_addr: str) -> str:
-    """基于邮箱生成符合 OpenAI 要求的密码（含大小写+数字+特殊字符）"""
-    base = email_addr.split("@", 1)[0][:8]
-    return base + "Kx#7"
+    return email_addr.split("@", 1)[0][:12]
 
 
 def signup_authorize_continue(login: CodexLogin) -> bool:
@@ -116,7 +114,7 @@ def signup_send_otp(login: CodexLogin) -> bool:
     return True
 
 
-def process_one_registration(idx, total, email_addr, outlook_pwd, client_id, ms_refresh_token, proxy, extract_token=True, fetch_session=True):
+def process_one_registration(idx, total, email_addr, outlook_pwd, client_id, ms_refresh_token, proxy):
     tag = email_addr.split("@")[0]
     log_fn = lambda msg: _safe_print(f"[{tag}] {msg}")
 
@@ -166,10 +164,6 @@ def process_one_registration(idx, total, email_addr, outlook_pwd, client_id, ms_
         if not login.step6_validate_otp(code):
             return False, email_addr, "OTP 验证失败"
 
-        # ── 和参考项目一致：OTP 后无条件做 create_account (about-you) ──
-        login._consent_url = "about-you"
-        login.step6b_about_you()
-
         result = {
             "email": email_addr,
             "registered": True,
@@ -181,56 +175,14 @@ def process_one_registration(idx, total, email_addr, outlook_pwd, client_id, ms_
 
         out_dir = os.path.join(SCRIPT_DIR, "output")
         os.makedirs(out_dir, exist_ok=True)
-
-        # ── 注册成功后，静默重登录获取个人 Token ──
-        token_extracted = False
-        if extract_token:
-            try:
-                log_fn("── 静默重登录获取 Token ──")
-
-                # 用密码重新登录（绕过 add-phone 等中间步骤）
-                token_data = login.relogin_with_password(password, client_id, ms_refresh_token)
-                if token_data:
-                    token_output = login._build_output(token_data)
-                    token_path = os.path.join(out_dir, f"token-{email_addr}.json")
-                    with _file_lock:
-                        with open(token_path, "w", encoding="utf-8") as f:
-                            json.dump(token_output, f, ensure_ascii=False, indent=2)
-                    log_fn(f"✅ Token 获取成功 → {token_path}")
-                    token_extracted = True
-
-                    # ── 获取 ChatGPT session 信息 ──
-                    if fetch_session:
-                        try:
-                            session_data = login.fetch_chatgpt_session(token_data.get("access_token", ""))
-                            if session_data:
-                                session_path = os.path.join(out_dir, f"session-{email_addr}.json")
-                                with _file_lock:
-                                    with open(session_path, "w", encoding="utf-8") as f:
-                                        json.dump(session_data, f, ensure_ascii=False, indent=2)
-                                log_fn(f"✅ Session 导出成功 → {session_path}")
-                            else:
-                                log_fn("⚠️ Session 获取失败")
-                        except Exception as se:
-                            log_fn(f"⚠️ Session 获取异常: {se}")
-                else:
-                    log_fn("⚠️ 重登录获取 Token 失败")
-            except Exception as te:
-                log_fn(f"⚠️ Token 获取异常 (不影响注册结果): {te}")
-
-        result["token_extracted"] = token_extracted
-        if token_extracted:
-            result["token_file"] = f"token-{email_addr}.json"
-
         out_path = os.path.join(out_dir, f"registered-{email_addr}.json")
 
         with _file_lock:
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(result, f, ensure_ascii=False, indent=2)
 
-        msg = "注册成功 + Token 已获取" if token_extracted else ("注册成功（OTP 已验证）" if not extract_token else "注册成功（Token 获取失败）")
-        log_fn(f"{msg} → {out_path}")
-        return True, email_addr, msg
+        log_fn(f"注册成功（已完成 OTP 验证）→ {out_path}")
+        return True, email_addr, "注册成功（OTP 已验证）"
     except Exception as e:
         log_fn(f"异常: {e}")
         traceback.print_exc()
@@ -241,8 +193,6 @@ def main():
     parser = argparse.ArgumentParser(description="OpenAI 新账号注册")
     parser.add_argument("--email", help="只处理指定邮箱")
     parser.add_argument("--workers", type=int, default=1, help="并发数")
-    parser.add_argument("--no-token", action="store_true", help="注册后不提取个人 Token")
-    parser.add_argument("--no-session", action="store_true", help="注册后不导出 Session")
     args = parser.parse_args()
 
     emails_path = os.path.join(SCRIPT_DIR, "emails.txt")
@@ -270,7 +220,7 @@ def main():
         email_addr, outlook_pwd, client_id, ms_refresh_token = entry
         raw_proxy = raw_proxies[(idx - 1) % len(raw_proxies)] if raw_proxies else ""
         proxy = ensure_proxy_chain(raw_proxy) if raw_proxy else raw_proxy
-        return process_one_registration(idx, len(entries), email_addr, outlook_pwd, client_id, ms_refresh_token, proxy, extract_token=not args.no_token, fetch_session=not args.no_session)
+        return process_one_registration(idx, len(entries), email_addr, outlook_pwd, client_id, ms_refresh_token, proxy)
 
     results = []
     if args.workers <= 1:
