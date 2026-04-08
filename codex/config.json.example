@@ -1,0 +1,7 @@
+{
+    "proxy": "",
+    "pre_proxy": "",
+    "max_workers": 1,
+    "outlook_input_file": "emails.txt",
+    "output_dir": "output"
+}
