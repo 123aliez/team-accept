@@ -40,6 +40,7 @@ from codex_login import (
 from accept_invite import (
     search_invite_emails,
     _parse_invite_params,
+    process_one as accept_process_one,
 )
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -182,28 +183,16 @@ def process_one(idx, total, email_addr, outlook_pwd, client_id, ms_refresh_token
             return False, email_addr, "authorize/continue(signup) 失败"
 
         page_type = (data.get("page") or {}).get("type", "")
-        already_registered = False
+        already_registered = page_type in ("login_password", "password")
 
-        if page_type in ("login_password", "password"):
-            # 已注册, 走密码登录
-            already_registered = True
-            log_fn("账号已注册, 使用密码登录...")
-            if not login.step5_password_verify(password):
-                return False, email_addr, "密码验证失败"
+        if already_registered:
+            log_fn("账号已注册, 跳过注册步骤")
         else:
             # 新账号: 注册流程
             reg_result = signup_set_password(login, password)
             if reg_result == "already_registered":
                 already_registered = True
-                log_fn("账号已注册(register返回400), 重新走密码登录...")
-                # 需要重新走一遍登录流程
-                login = CodexLogin(email=email_addr, proxy=proxy, tag=tag)
-                login.step1_oauth_init()
-                login.step2_sentinel_probe()
-                if not login.step3_authorize_continue():
-                    return False, email_addr, "重新登录 authorize/continue 失败"
-                if not login.step5_password_verify(password):
-                    return False, email_addr, "密码验证失败"
+                log_fn("账号已注册(register返回400)")
             elif reg_result != "ok":
                 return False, email_addr, "设置密码失败"
             else:
@@ -245,107 +234,19 @@ def process_one(idx, total, email_addr, outlook_pwd, client_id, ms_refresh_token
                         json.dump(reg_data, f, ensure_ascii=False, indent=2)
                 log_fn(f"[注册] ✅ 注册成功")
 
-        # about-you (新账号需要, 已注册账号会自动跳过)
-        if not login.step6b_about_you():
-            return False, email_addr, "about-you 失败"
-
         reg_msg = "已注册" if already_registered else "注册成功"
         log_fn(f"阶段1完成: {reg_msg}")
 
-        # ── 阶段2: 搜邀请 + 选workspace + 拿token ──
-        # 直接复用当前 login session, 不需要重新登录
+        # ── 阶段2: 接受邀请 (直接复用 accept_invite.py 已验证的流程) ──
         log_fn("━━━ 阶段2: 接受邀请 ━━━")
 
-        log_fn("[接受邀请] 搜索邀请邮件...")
-        invite_results = search_invite_emails(
-            email_addr, client_id, ms_refresh_token, log_fn=log_fn)
+        accept_ok, _, accept_msg = accept_process_one(
+            idx, total, email_addr, outlook_pwd, client_id, ms_refresh_token, proxy)
 
-        if not invite_results:
-            return False, email_addr, f"{reg_msg}但未找到邀请邮件"
+        if not accept_ok:
+            return False, email_addr, f"{reg_msg}但接受邀请失败: {accept_msg}"
 
-        log_fn(f"[接受邀请] 找到 {len(invite_results)} 个邀请链接")
-        for i, (link, subj) in enumerate(invite_results):
-            log_fn(f"  [{i+1}] {link}")
-
-        invite_url = invite_results[0][0]
-        params = _parse_invite_params(invite_url)
-        accept_wid = params.get("accept_wId") or params.get("wId")
-        ws_name = params.get("inv_ws_name") or "Unknown"
-
-        if accept_wid:
-            log_fn(f"[接受邀请] 团队工作区: {ws_name} ({accept_wid})")
-
-        login._delay(0.5, 1.5)
-
-        # 选择团队工作区
-        if accept_wid:
-            log_fn(f"[接受邀请] 选择团队工作区...")
-            try:
-                r = login.session.post(
-                    f"{AUTH}/api/accounts/workspace/select",
-                    json={"workspace_id": accept_wid},
-                    headers={
-                        "Content-Type": "application/json",
-                        "Accept": "application/json",
-                        "Origin": AUTH,
-                        "User-Agent": login.fp.user_agent,
-                        "Referer": f"{AUTH}/sign-in-with-chatgpt/codex/consent",
-                    },
-                    timeout=15, impersonate=login.fp.impersonate)
-                log_fn(f"  workspace/select -> {r.status_code}")
-                if r.status_code == 200:
-                    m = re.search(
-                        r'login_verifier["\s:=]+([A-Za-z0-9_\-]{20,})', r.text)
-                    if m:
-                        login._login_verifier = m.group(1)
-                    try:
-                        ws_data = r.json()
-                        cu = ws_data.get("continue_url", "")
-                        if cu:
-                            login._continue_url = cu
-                    except Exception:
-                        pass
-                else:
-                    log_fn(f"  workspace/select 失败: {r.text[:200]}")
-            except Exception as e:
-                log_fn(f"  workspace/select 异常: {e}")
-
-        # 获取 auth code + token
-        if not login.step7_get_auth_code():
-            return False, email_addr, f"{reg_msg}但获取 auth code 失败"
-
-        token_data = login.step9_exchange_token()
-        if not token_data:
-            return False, email_addr, f"{reg_msg}但 token 交换失败"
-
-        result = login._build_output(token_data)
-        result["disabled"] = False
-
-        account_id = result.get("account_id", "")
-        payload = decode_jwt_payload(result.get("access_token", ""))
-        auth_info = payload.get("https://api.openai.com/auth", {})
-        plan = auth_info.get("chatgpt_plan_type", "free")
-
-        # 保存 team token
-        config = _load_config()
-        output_dir = config.get("output_dir", "output")
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        if not os.path.isabs(output_dir):
-            output_dir = os.path.join(base_dir, output_dir)
-        os.makedirs(output_dir, exist_ok=True)
-
-        short_id = account_id[:8] if account_id else "unknown"
-        out_filename = f"codex-{short_id}-{email_addr}-{plan}.json"
-        out_path = os.path.join(output_dir, out_filename)
-
-        with _file_lock:
-            with open(out_path, "w", encoding="utf-8") as f:
-                json.dump(result, f, ensure_ascii=False)
-
-        log_fn(f"[接受邀请] ✅ Team Token 已保存 → {out_path}")
-        log_fn(f"  account_id: {account_id}")
-        log_fn(f"  plan: {plan}")
-        return True, email_addr, f"{reg_msg} + Team Token ({plan})"
+        return True, email_addr, f"{reg_msg} + {accept_msg}"
 
     except Exception as e:
         log_fn(f"异常: {e}")

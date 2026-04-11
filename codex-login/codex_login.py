@@ -550,16 +550,24 @@ def _imap_connect(email_addr, access_token, imap_server):
 
 
 def _get_openai_mail_ids(imap) -> set:
-    """获取收件箱中 OpenAI 发件人的邮件 ID (合并所有 OpenAI 地址)"""
-    imap.select("INBOX")
+    """获取 INBOX + Junk 中 OpenAI 发件人的邮件 ID (合并所有 OpenAI 地址)"""
     all_ids = set()
-    for sender in ('(FROM "noreply@tm.openai.com")', '(FROM "openai.com")'):
+    for folder in ("INBOX", "Junk"):
         try:
-            status, msg_ids = imap.search(None, sender)
-            if status == "OK" and msg_ids[0]:
-                all_ids.update(msg_ids[0].split())
+            status, _ = imap.select(folder)
+            if status != "OK":
+                continue
         except Exception:
-            pass
+            continue
+        for sender in ('(FROM "noreply@tm.openai.com")', '(FROM "openai.com")'):
+            try:
+                status, msg_ids = imap.search(None, sender)
+                if status == "OK" and msg_ids[0]:
+                    # 用 folder:id 格式避免不同文件夹间 ID 冲突
+                    for mid in msg_ids[0].split():
+                        all_ids.add((folder, mid))
+            except Exception:
+                pass
     return all_ids
 
 
@@ -664,6 +672,14 @@ def fetch_otp(email_addr, client_id, refresh_token, known_ids=None,
     check_count = 0
     fallback_tried = False
 
+    def _fetch_otp_from_entry(imap, folder, mid):
+        """切换到对应文件夹后提取 OTP"""
+        try:
+            imap.select(folder)
+        except Exception:
+            return None, None
+        return _extract_otp_from_mail(imap, mid)
+
     while time.time() - start_time < timeout:
         check_count += 1
         elapsed = int(time.time() - start_time)
@@ -675,12 +691,12 @@ def fetch_otp(email_addr, client_id, refresh_token, known_ids=None,
 
                 if new_ids:
                     # 按邮件 ID 倒序 (最新的优先)
-                    sorted_new = sorted(new_ids, key=lambda x: int(x), reverse=True)
-                    for mid in sorted_new:
-                        otp, subject = _extract_otp_from_mail(imap, mid)
+                    sorted_new = sorted(new_ids, key=lambda x: int(x[1]), reverse=True)
+                    for folder, mid in sorted_new:
+                        otp, subject = _fetch_otp_from_entry(imap, folder, mid)
                         if otp:
                             if log_fn:
-                                log_fn(f"[OTP] ✅ 验证码: {otp} (主题: {subject})")
+                                log_fn(f"[OTP] ✅ 验证码: {otp} (主题: {subject}, 文件夹: {folder})")
                             return otp
 
                 # 50 秒无新邮件 → 回退尝试已有邮件中最新一封
@@ -688,12 +704,12 @@ def fetch_otp(email_addr, client_id, refresh_token, known_ids=None,
                     fallback_tried = True
                     if log_fn:
                         log_fn("[OTP] 50s 无新邮件, 回退尝试已有邮件中最新一封...")
-                    sorted_known = sorted(known_ids, key=lambda x: int(x), reverse=True)
-                    for mid in sorted_known[:3]:
-                        otp, subject = _extract_otp_from_mail(imap, mid)
+                    sorted_known = sorted(known_ids, key=lambda x: int(x[1]), reverse=True)
+                    for folder, mid in sorted_known[:3]:
+                        otp, subject = _fetch_otp_from_entry(imap, folder, mid)
                         if otp:
                             if log_fn:
-                                log_fn(f"[OTP] ✅ 验证码 (回退): {otp} (主题: {subject})")
+                                log_fn(f"[OTP] ✅ 验证码 (回退): {otp} (主题: {subject}, 文件夹: {folder})")
                             return otp
             finally:
                 try: imap.logout()
@@ -1101,6 +1117,13 @@ class CodexLogin:
             self._log(f"  consent 页面异常: {e}")
 
         # ─── 7b: 尝试 workspace/select ───
+        # 如果有邀请指定的 workspace_id, 插到候选列表最前面
+        invite_ws = getattr(self, "_invite_workspace_id", None)
+        if invite_ws and invite_ws not in ws_candidates:
+            ws_candidates.insert(0, invite_ws)
+        elif invite_ws:
+            ws_candidates.remove(invite_ws)
+            ws_candidates.insert(0, invite_ws)
         # 去重候选列表
         ws_candidates = list(dict.fromkeys(ws_candidates))
         self._log(f"  workspace 候选: {ws_candidates}")
