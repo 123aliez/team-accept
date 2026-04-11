@@ -264,6 +264,8 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             return self._start_task("register", CODEX_DIR, body)
         elif path == "/api/run/accept":
             return self._start_task("accept", LOGIN_DIR, body)
+        elif path == "/api/run/register-accept":
+            return self._start_task("register_accept", LOGIN_DIR, body)
         elif path == "/api/run/login":
             return self._start_task("login", LOGIN_DIR, body)
         elif path == "/api/task/stop":
@@ -361,6 +363,11 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                 cmd += ["--email", email_lines[0].split("----")[0].strip()]
         elif task_type == "accept":
             cmd = [sys.executable, str(work_dir / "accept_invite.py")]
+            if len(email_lines) == 1:
+                cmd += ["--email", email_lines[0].split("----")[0].strip()]
+        elif task_type == "register_accept":
+            work_dir = LOGIN_DIR
+            cmd = [sys.executable, str(LOGIN_DIR / "register_and_accept.py")]
             if len(email_lines) == 1:
                 cmd += ["--email", email_lines[0].split("----")[0].strip()]
         elif task_type == "login":
@@ -660,9 +667,8 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
           <label>并发数</label>
           <input type="number" id="shared-workers" value="2" min="1" max="20">
         </div>
-        <button class="btn btn-primary" onclick="runTask('register')">🚀 开始注册</button>
+        <button class="btn btn-green" onclick="runTask('register-accept')">🚀 注册 + 接受邀请</button>
         <button class="btn btn-orange" onclick="runTask('login')">🔑 登录取 Token</button>
-        <button class="btn btn-green" onclick="runTask('accept')">✅ 接受邀请 + 取 Token</button>
       </div>
       <div style="display:flex;gap:16px;margin-top:8px;padding-left:2px">
         <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;user-select:none">
@@ -795,7 +801,7 @@ async function refreshTasks() {
   el.innerHTML = tasks.reverse().map(t => `
     <div class="task-item" onclick="showTask('${t.id}')">
       <div class="meta">
-        <span class="type">${{register:'📝 注册',accept:'✅ 接受邀请+Token',login:'🔑 登录取Token'}[t.type] || t.type}</span>
+        <span class="type">${{register:'📝 注册',accept:'✅ 接受邀请+Token',register_accept:'🚀 注册+接受邀请',login:'🔑 登录取Token'}[t.type] || t.type}</span>
         <span class="status ${t.status}">${t.status}</span>
       </div>
       <div class="meta" style="margin-top:6px">
