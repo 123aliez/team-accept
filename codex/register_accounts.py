@@ -33,7 +33,8 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def derive_password(email_addr: str) -> str:
-    return email_addr.split("@", 1)[0][:12]
+    local = email_addr.split("@", 1)[0]
+    return local.split("+", 1)[0]
 
 
 def signup_authorize_continue(login: CodexLogin) -> bool:

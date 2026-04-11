@@ -133,9 +133,26 @@ def search_invite_emails(email_addr, client_id, refresh_token,
 
         seen_ids = set()
 
+        # 先搜索全部邮件，找出最近的发件人，辅助调试
+        try:
+            status_all, data_all = imap.search(None, "ALL")
+            if status_all == "OK" and data_all[0]:
+                all_ids = data_all[0].split()
+                _log(f"[Invite] 收件箱共 {len(all_ids)} 封邮件，扫描最近 10 封的发件人...")
+                for mid in reversed(all_ids[-10:]):
+                    try:
+                        st, md = imap.fetch(mid, "(BODY[HEADER.FIELDS (FROM SUBJECT)])")
+                        if st == "OK":
+                            _log(f"[Invite]   #{mid.decode()}: {md[0][1].decode(errors='ignore').strip()}")
+                    except Exception:
+                        pass
+        except Exception as e:
+            _log(f"[Invite] 全量扫描异常: {e}")
+
         for criteria in search_criteria:
             try:
                 status, data = imap.search(None, criteria)
+                _log(f"[Invite] 搜索 {criteria} -> {status}, 找到 {len(data[0].split()) if data[0] else 0} 封")
                 if status != "OK" or not data[0]:
                     continue
 
@@ -273,50 +290,62 @@ def process_one(idx, total, email_addr, outlook_pwd, client_id,
         if not login.step3_authorize_continue():
             return False, email_addr, "authorize/continue 失败"
 
-        login.step4_sentinel_probe2()
+        # ── 检查服务端期望的登录方式 ──
+        next_page = getattr(login, "_next_page_type", "")
+        # 密码 = 邮箱 @ 前面的部分 (注册时的规则)
+        password = email_addr.split("@")[0].split("+")[0]
 
-        # 快照旧邮件 (send-otp 之前)
-        known_ids = get_known_mail_ids(
-            email_addr, client_id, ms_refresh_token,
-            impersonate=login.fp.impersonate, log_fn=login._log)
-
-        if not login.step5_send_otp():
-            return False, email_addr, "send-otp 失败 (账号可能未注册)"
-
-        login._delay(2.0, 5.0)
-
-        # 自动获取 OTP
-        log_fn("[3/4] 等待验证码...")
-        code = fetch_otp(
-            email_addr, client_id, ms_refresh_token,
-            known_ids=known_ids, timeout=120,
-            impersonate=login.fp.impersonate, log_fn=login._log)
-
-        if not code:
-            return False, email_addr, "OTP 获取超时"
-
-        if not login.step6_validate_otp(code):
-            # OTP 验证失败, 可能取到了邀请邮件中的数字, 重试一次
-            log_fn("OTP 验证失败, 将已用邮件加入 known_ids 后重试...")
-            known_ids.add(code)  # 标记, 不影响逻辑
-            # 重新发送 OTP
-            login.step2_sentinel_probe()
+        if next_page == "password":
+            # 服务端要求密码登录
+            log_fn(f"服务端要求密码登录, 使用密码验证...")
+            if not login.step5_password_verify(password):
+                return False, email_addr, "密码验证失败"
+        else:
+            # 默认 OTP 流程
             login.step4_sentinel_probe2()
+
+            # 快照旧邮件 (send-otp 之前)
+            known_ids = get_known_mail_ids(
+                email_addr, client_id, ms_refresh_token,
+                impersonate=login.fp.impersonate, log_fn=login._log)
+
             if not login.step5_send_otp():
-                return False, email_addr, "重试 send-otp 失败"
-            login._delay(3.0, 6.0)
-            # 重新快照 (把之前的旧邮件+错误邮件都过滤掉)
-            known_ids_retry = get_known_mail_ids(
+                return False, email_addr, "send-otp 失败 (账号可能未注册)"
+
+            login._delay(2.0, 5.0)
+
+            # 自动获取 OTP
+            log_fn("[3/4] 等待验证码...")
+            code = fetch_otp(
                 email_addr, client_id, ms_refresh_token,
+                known_ids=known_ids, timeout=120,
                 impersonate=login.fp.impersonate, log_fn=login._log)
-            code2 = fetch_otp(
-                email_addr, client_id, ms_refresh_token,
-                known_ids=known_ids_retry, timeout=120,
-                impersonate=login.fp.impersonate, log_fn=login._log)
-            if not code2:
-                return False, email_addr, "重试 OTP 获取超时"
-            if not login.step6_validate_otp(code2):
-                return False, email_addr, "OTP 验证失败 (重试后仍失败)"
+
+            if not code:
+                return False, email_addr, "OTP 获取超时"
+
+            if not login.step6_validate_otp(code):
+                # OTP 验证失败, 可能取到了邀请邮件中的数字, 重试一次
+                log_fn("OTP 验证失败, 将已用邮件加入 known_ids 后重试...")
+                known_ids.add(code)  # 标记, 不影响逻辑
+                # 重新发送 OTP
+                login.step2_sentinel_probe()
+                login.step4_sentinel_probe2()
+                if not login.step5_send_otp():
+                    return False, email_addr, "重试 send-otp 失败"
+                login._delay(3.0, 6.0)
+                # 重新快照 (把之前的旧邮件+错误邮件都过滤掉)
+                known_ids_retry = get_known_mail_ids(
+                    email_addr, client_id, ms_refresh_token,
+                    impersonate=login.fp.impersonate, log_fn=login._log)
+                code2 = fetch_otp(
+                    email_addr, client_id, ms_refresh_token,
+                    known_ids=known_ids_retry, timeout=120,
+                    impersonate=login.fp.impersonate, log_fn=login._log)
+                if not code2:
+                    return False, email_addr, "重试 OTP 获取超时"
+                if not login.step6_validate_otp(code2):
+                    return False, email_addr, "OTP 验证失败 (重试后仍失败)"
 
         if not login.step6b_about_you():
             return False, email_addr, "about-you 失败"

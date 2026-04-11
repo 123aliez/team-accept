@@ -531,10 +531,20 @@ def _get_imap_access_token(client_id: str, refresh_token: str, impersonate: str 
     raise Exception(f"IMAP access token 获取失败: {last_error[:150]}")
 
 
+def _strip_plus_alias(email_addr: str) -> str:
+    """去掉邮箱中的 + 别名部分, 如 foo+bar@hotmail.com -> foo@hotmail.com"""
+    local, _, domain = email_addr.partition("@")
+    if "+" in local:
+        local = local.split("+", 1)[0]
+    return f"{local}@{domain}" if domain else email_addr
+
+
 def _imap_connect(email_addr, access_token, imap_server):
     """XOAUTH2 认证连接 IMAP"""
+    # Outlook IMAP 认证需要用主邮箱地址 (不带 + 别名)
+    clean_email = _strip_plus_alias(email_addr)
     imap = imaplib.IMAP4_SSL(imap_server, 993)
-    auth_string = f"user={email_addr}\x01auth=Bearer {access_token}\x01\x01"
+    auth_string = f"user={clean_email}\x01auth=Bearer {access_token}\x01\x01"
     imap.authenticate("XOAUTH2", lambda x: auth_string.encode("utf-8"))
     return imap
 
@@ -741,6 +751,7 @@ class CodexLogin:
         self._auth_code = None
         self._sentinel_token_1 = None
         self._sentinel_token_2 = None
+        self._next_page_type = ""
 
     def _log(self, msg):
         _safe_print(f"[{self.tag}] {msg}")
@@ -814,8 +825,12 @@ class CodexLogin:
         try:
             data = r.json()
             self._log(f"  响应: {json.dumps(data, ensure_ascii=False)[:200]}")
+            # 保存服务端期望的下一步类型 (password / passwordless 等)
+            self._next_page_type = (data.get("page") or {}).get("type", "")
+            if self._next_page_type:
+                self._log(f"  下一步类型: {self._next_page_type}")
         except Exception:
-            pass
+            self._next_page_type = ""
         self._delay(0.5, 1.0)
         return True
 
@@ -843,6 +858,39 @@ class CodexLogin:
         if r.status_code != 200:
             self._log(f"  ⚠️ 失败: {r.text[:200]}")
             return False
+        return True
+
+    # ── Step 5b: 密码验证 (当 authorize/continue 返回 password 类型时) ──
+    def step5_password_verify(self, password: str) -> bool:
+        """
+        当 authorize/continue 指示需要密码登录时, 用密码验证代替 OTP。
+        成功后服务端 session 进入已认证状态, 可直接获取 auth code。
+        """
+        self._log("[Step 5b] 密码验证 (password/verify)...")
+        sentinel = fetch_sentinel_token(
+            self.session, self.fp, "login_password", self._log)
+
+        headers = {"Content-Type": "application/json", "Accept": "application/json",
+                    "Origin": AUTH, "Referer": f"{AUTH}/log-in/password"}
+        headers.update(self.fp.headers())
+        if sentinel:
+            headers["openai-sentinel-token"] = sentinel
+
+        r = self.session.post(
+            f"{AUTH}/api/accounts/password/verify",
+            json={"password": password},
+            headers=headers, timeout=30, impersonate=self.fp.impersonate)
+        self._log(f"  password/verify -> {r.status_code}")
+        if r.status_code != 200:
+            self._log(f"  ⚠️ 密码验证失败: {r.text[:300]}")
+            return False
+
+        try:
+            data = r.json()
+            self._log(f"  响应: {json.dumps(data, ensure_ascii=False)[:300]}")
+            self._consent_url = data.get("continue_url", "")
+        except Exception:
+            self._consent_url = ""
         return True
 
     # ── Step 6: 验证 OTP ──
@@ -1222,12 +1270,13 @@ class CodexLogin:
         return r.json()
 
     # ── 主流程 ──
-    def run(self, otp_fn=None) -> dict:
+    def run(self, otp_fn=None, password: str = None) -> dict:
         """
         执行完整登录流程
 
         Args:
             otp_fn: OTP 获取回调函数, 签名: fn() -> str
+            password: 密码 (当服务端要求密码登录时使用)
         Returns:
             输出 JSON dict, 或 None
         """
@@ -1235,23 +1284,32 @@ class CodexLogin:
         self.step2_sentinel_probe()
         if not self.step3_authorize_continue():
             return None
-        self.step4_sentinel_probe2()
-        if not self.step5_send_otp():
-            return None
-        self._delay(2.0, 5.0)
 
-        # 获取 OTP
-        self._log("等待验证码...")
-        if not otp_fn:
-            code = input(f"[{self.tag}] 请输入验证码: ").strip()
+        if self._next_page_type == "password":
+            # 服务端要求密码登录
+            pwd = password or self.email.split("@")[0]
+            self._log(f"服务端要求密码登录, 使用密码验证...")
+            if not self.step5_password_verify(pwd):
+                return None
         else:
-            code = otp_fn()
-        if not code:
-            self._log("⚠️ 未获取到验证码")
-            return None
+            self.step4_sentinel_probe2()
+            if not self.step5_send_otp():
+                return None
+            self._delay(2.0, 5.0)
 
-        if not self.step6_validate_otp(code):
-            return None
+            # 获取 OTP
+            self._log("等待验证码...")
+            if not otp_fn:
+                code = input(f"[{self.tag}] 请输入验证码: ").strip()
+            else:
+                code = otp_fn()
+            if not code:
+                self._log("⚠️ 未获取到验证码")
+                return None
+
+            if not self.step6_validate_otp(code):
+                return None
+
         if not self.step6b_about_you():
             return None
         self._delay(0.5, 1.5)
@@ -1522,30 +1580,40 @@ def _login_one(idx: int, total: int, email: str, outlook_pwd: str,
         login.step2_sentinel_probe()
         if not login.step3_authorize_continue():
             return False, email, "authorize/continue failed"
-        login.step4_sentinel_probe2()
 
-        # ★ 在 send-otp 之前快照旧邮件
-        known_ids = get_known_mail_ids(
-            email, client_id, ms_refresh_token,
-            impersonate=login.fp.impersonate, log_fn=login._log)
+        # ── 检查服务端期望的登录方式 ──
+        next_page = getattr(login, "_next_page_type", "")
+        password = email.split("@")[0].split("+")[0]
 
-        if not login.step5_send_otp():
-            return False, email, "send-otp failed"
+        if next_page == "password":
+            login._log(f"服务端要求密码登录, 使用密码验证...")
+            if not login.step5_password_verify(password):
+                return False, email, "password verify failed"
+        else:
+            login.step4_sentinel_probe2()
 
-        login._delay(2.0, 5.0)
+            # ★ 在 send-otp 之前快照旧邮件
+            known_ids = get_known_mail_ids(
+                email, client_id, ms_refresh_token,
+                impersonate=login.fp.impersonate, log_fn=login._log)
 
-        # ★ 从新邮件中获取 OTP
-        login._log("等待验证码...")
-        code = fetch_otp(
-            email, client_id, ms_refresh_token,
-            known_ids=known_ids, timeout=120,
-            impersonate=login.fp.impersonate, log_fn=login._log)
+            if not login.step5_send_otp():
+                return False, email, "send-otp failed"
 
-        if not code:
-            return False, email, "OTP 超时"
+            login._delay(2.0, 5.0)
 
-        if not login.step6_validate_otp(code):
-            return False, email, "OTP validate failed"
+            # ★ 从新邮件中获取 OTP
+            login._log("等待验证码...")
+            code = fetch_otp(
+                email, client_id, ms_refresh_token,
+                known_ids=known_ids, timeout=120,
+                impersonate=login.fp.impersonate, log_fn=login._log)
+
+            if not code:
+                return False, email, "OTP 超时"
+
+            if not login.step6_validate_otp(code):
+                return False, email, "OTP validate failed"
 
         if not login.step6b_about_you():
             return False, email, "about-you failed"

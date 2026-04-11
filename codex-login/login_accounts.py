@@ -304,7 +304,7 @@ def process_one_login(idx, total, email_addr, outlook_pwd, client_id, ms_refresh
     tag = email_addr.split("@")[0]
     log_fn = lambda msg: _safe_print(f"[{tag}] {msg}")
     # 密码 = 邮箱 @ 前面的部分
-    password = email_addr.split("@")[0]
+    password = email_addr.split("@")[0].split("+")[0]
 
     _safe_print(f"\n{'='*60}")
     _safe_print(f"  [{idx}/{total}] OTP 登录: {email_addr}")
@@ -321,32 +321,42 @@ def process_one_login(idx, total, email_addr, outlook_pwd, client_id, ms_refresh
         if not login.step3_authorize_continue():
             return False, email_addr, "authorize/continue 失败"
 
-        login.step4_sentinel_probe2()
+        # ── 检查服务端期望的登录方式 ──
+        next_page = getattr(login, "_next_page_type", "")
 
-        # 快照旧邮件
-        known_ids = get_known_mail_ids(
-            email_addr, client_id, ms_refresh_token,
-            impersonate=login.fp.impersonate, log_fn=login._log)
+        if next_page == "password":
+            # 服务端要求密码登录（账号注册时设置了密码）
+            log_fn(f"服务端要求密码登录, 使用密码验证...")
+            if not login.step5_password_verify(password):
+                return False, email_addr, "密码验证失败"
+        else:
+            # 默认 OTP 流程
+            login.step4_sentinel_probe2()
 
-        if not login.step5_send_otp():
-            return False, email_addr, "send-otp 失败 (账号可能未注册)"
+            # 快照旧邮件
+            known_ids = get_known_mail_ids(
+                email_addr, client_id, ms_refresh_token,
+                impersonate=login.fp.impersonate, log_fn=login._log)
 
-        login._delay(2.0, 5.0)
+            if not login.step5_send_otp():
+                return False, email_addr, "send-otp 失败 (账号可能未注册)"
 
-        # 获取 OTP
-        log_fn("等待验证码...")
-        code = fetch_otp(
-            email_addr, client_id, ms_refresh_token,
-            known_ids=known_ids, timeout=120,
-            impersonate=login.fp.impersonate, log_fn=login._log)
+            login._delay(2.0, 5.0)
 
-        if not code:
-            return False, email_addr, "OTP 获取超时"
+            # 获取 OTP
+            log_fn("等待验证码...")
+            code = fetch_otp(
+                email_addr, client_id, ms_refresh_token,
+                known_ids=known_ids, timeout=120,
+                impersonate=login.fp.impersonate, log_fn=login._log)
 
-        if not login.step6_validate_otp(code):
-            return False, email_addr, "OTP 验证失败"
+            if not code:
+                return False, email_addr, "OTP 获取超时"
 
-        # 检查 validate-otp 响应的 _consent_url
+            if not login.step6_validate_otp(code):
+                return False, email_addr, "OTP 验证失败"
+
+        # 检查 validate-otp / password-verify 响应的 _consent_url
         consent_url = getattr(login, "_consent_url", "") or ""
 
         # ── add-phone 检测: 用密码重登录绕过 ──

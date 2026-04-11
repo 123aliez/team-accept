@@ -245,7 +245,7 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/failures":
             return self._json(_get_all_failures())
         elif path == "/api/export/tokens":
-            return self._export_tokens()
+            return self._export_tokens(team_only=True)
         elif path == "/api/export/personal-tokens":
             return self._export_tokens(personal_only=True)
         elif path == "/api/export/sessions":
@@ -270,6 +270,10 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             return self._stop_task(body)
         elif path == "/api/clear/tokens":
             return self._clear_files("tokens")
+        elif path == "/api/clear/personal-tokens":
+            return self._clear_files("personal-tokens")
+        elif path == "/api/clear/team-tokens":
+            return self._clear_files("team-tokens")
         elif path == "/api/clear/sessions":
             return self._clear_files("sessions")
         else:
@@ -419,7 +423,28 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                 if f.is_dir() or f.name == "proxy-chains":
                     continue
                 if file_type == "tokens":
-                    if f.name.startswith("token-") or (f.suffix == ".json" and not f.name.startswith(("session-", "registered-"))):
+                    # 清除所有 token (个人+team)
+                    if f.suffix == ".json" and not f.name.startswith(("session-", "registered-")):
+                        try:
+                            data = json.loads(f.read_text(encoding="utf-8"))
+                            if data.get("access_token"):
+                                f.unlink()
+                                count += 1
+                        except Exception:
+                            pass
+                elif file_type == "personal-tokens":
+                    # 只清除个人 token (token- 前缀)
+                    if f.name.startswith("token-"):
+                        try:
+                            data = json.loads(f.read_text(encoding="utf-8"))
+                            if data.get("access_token"):
+                                f.unlink()
+                                count += 1
+                        except Exception:
+                            pass
+                elif file_type == "team-tokens":
+                    # 只清除 team token (codex- 前缀或含 -team)
+                    if f.suffix == ".json" and (f.name.startswith("codex-") or "-team" in f.name) and not f.name.startswith(("session-", "registered-", "token-")):
                         try:
                             data = json.loads(f.read_text(encoding="utf-8"))
                             if data.get("access_token"):
@@ -434,19 +459,19 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                             count += 1
                         except Exception:
                             pass
-        label = "Token" if file_type == "tokens" else "Session"
+        labels = {"tokens": "Token", "personal-tokens": "个人 Token", "team-tokens": "Team Token", "sessions": "Session"}
+        label = labels.get(file_type, file_type)
         return self._json({"message": f"已清除 {count} 个 {label} 文件"})
 
-    def _export_tokens(self, personal_only=False):
+    def _export_tokens(self, personal_only=False, team_only=False):
         """导出 token JSON 文件为 zip 压缩包"""
         import io
         import zipfile
 
         buf = io.BytesIO()
         count = 0
-        seen_emails = set()
+        seen = set()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            # 扫描 codex-login/output 和 codex/output 两个目录
             for output_dir in (LOGIN_DIR / "output", CODEX_DIR / "output"):
                 if not output_dir.exists():
                     continue
@@ -455,30 +480,30 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                         continue
                     try:
                         data = json.loads(f.read_text(encoding="utf-8"))
-                        if data.get("access_token"):
-                            # 判断是否 Team Token: 文件名含 -team 或无 token- 前缀且在 login 目录
-                            is_team = "-team" in f.name
-                            if personal_only and is_team:
-                                continue
-                            if not personal_only:
-                                pass  # 导出全部
-                            email = data.get("email", "")
-                            key = email or f.name
-                            if key in seen_emails:
-                                continue
-                            seen_emails.add(key)
-                            out_name = f"{email}.json" if email else f.name
-                            zf.writestr(out_name, json.dumps(data, ensure_ascii=False, indent=2))
-                            count += 1
+                        if not data.get("access_token"):
+                            continue
+                        is_team = f.name.startswith("codex-") or "-team" in f.name
+                        if personal_only and is_team:
+                            continue
+                        if team_only and not is_team:
+                            continue
+                        email = data.get("email", "")
+                        suffix = "-team" if is_team else ""
+                        out_name = f"{email}{suffix}.json" if email else f.name
+                        if out_name in seen:
+                            continue
+                        seen.add(out_name)
+                        zf.writestr(out_name, json.dumps(data, ensure_ascii=False, indent=2))
+                        count += 1
                     except Exception:
                         pass
 
         if count == 0:
-            label = "个人 token" if personal_only else "token"
+            label = "个人 Token" if personal_only else ("Team Token" if team_only else "Token")
             return self._json({"error": f"无可导出的 {label}"}, 404)
 
         body = buf.getvalue()
-        prefix = "personal_tokens" if personal_only else "tokens"
+        prefix = "personal_tokens" if personal_only else ("team_tokens" if team_only else "tokens")
         fname = f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
         self.send_response(200)
         self.send_header("Content-Type", "application/zip")
@@ -662,20 +687,21 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
       <div>
         <div class="card" style="margin-bottom:20px">
           <h3>
-            <span class="icon">📝</span> 注册结果
+            <span class="icon">🔑</span> 个人 Token
             <button class="btn btn-sm btn-primary" onclick="loadTokenResults()" style="margin-left:auto">刷新</button>
+            <button class="btn btn-sm btn-orange" onclick="exportPersonalTokens()">📥 导出</button>
+            <button class="btn btn-sm btn-red" onclick="clearFiles('personal-tokens')">🗑 清除</button>
           </h3>
-          <div class="results-scroll" id="reg-results" style="max-height:180px"><div class="empty">暂无注册记录</div></div>
+          <div class="results-scroll" id="personal-token-results" style="max-height:180px"><div class="empty">暂无个人 Token</div></div>
         </div>
         <div class="card" style="margin-bottom:20px">
           <h3>
-            <span class="icon">🎫</span> Token 结果
+            <span class="icon">🎫</span> Team Token
             <button class="btn btn-sm btn-primary" onclick="loadTokenResults()" style="margin-left:auto">刷新</button>
-            <button class="btn btn-sm btn-green" onclick="exportTokens()">📥 全部</button>
-            <button class="btn btn-sm btn-orange" onclick="exportPersonalTokens()">📥 个人</button>
-            <button class="btn btn-sm btn-red" onclick="clearFiles('tokens')">🗑 清除</button>
+            <button class="btn btn-sm btn-green" onclick="exportTokens()">📥 导出</button>
+            <button class="btn btn-sm btn-red" onclick="clearFiles('team-tokens')">🗑 清除</button>
           </h3>
-          <div class="results-scroll" id="token-results"><div class="empty">暂无 Token</div></div>
+          <div class="results-scroll" id="token-results"><div class="empty">暂无 Team Token</div></div>
         </div>
         <div class="card">
           <h3>
@@ -801,50 +827,58 @@ async function loadTokenResults() {
   const [codex, login] = await Promise.all([
     api('/api/results/codex'), api('/api/results/login')
   ]);
-  const el = document.getElementById('token-results');
-  let html = '';
 
   const codexTokens = codex.filter(r => r.access_token && !(r._filename||'').startsWith('session-'));
   const allTokens = [...login.filter(r => r.access_token), ...codexTokens];
 
-  if (allTokens.length) {
-    html += '<div style="font-size:12px;color:var(--text2);margin-bottom:6px">' + allTokens.length + ' 个 Token</div>';
-    for (const r of allTokens) {
-      const source = r._filename && r._filename.startsWith('token-') ? ' (注册提取)' : '';
-      html += `<div class="result-item success">
-        <div class="r-email ok">✅ ${r.email||r._filename}${source}</div>
+  const personalTokens = [];
+  const teamTokens = [];
+  for (const r of allTokens) {
+    const fn = r._filename || '';
+    const isTeam = fn.startsWith('codex-') || fn.includes('-team');
+    if (isTeam) { teamTokens.push(r); } else { personalTokens.push(r); }
+  }
+
+  // 个人 Token
+  const pEl = document.getElementById('personal-token-results');
+  if (pEl) {
+    let pHtml = '';
+    if (personalTokens.length) {
+      pHtml += '<div style="font-size:12px;color:var(--text2);margin-bottom:6px">' + personalTokens.length + ' 个个人 Token</div>';
+      for (const r of personalTokens) {
+        pHtml += `<div class="result-item success">
+          <div class="r-email ok">✅ ${r.email||r._filename}</div>
+          ${r.type?`<div class="r-info">类型: ${r.type} | 过期: ${r.expired||'-'}</div>`:''}
+          <div class="r-token">${r.access_token.substring(0,100)}...</div>
+        </div>`;
+      }
+    }
+    pEl.innerHTML = pHtml || '<div class="empty">暂无个人 Token</div>';
+  }
+
+  // Team Token
+  const tEl = document.getElementById('token-results');
+  let tHtml = '';
+  if (teamTokens.length) {
+    tHtml += '<div style="font-size:12px;color:var(--text2);margin-bottom:6px">' + teamTokens.length + ' 个 Team Token</div>';
+    for (const r of teamTokens) {
+      const tName = (r.email || r._filename) + '-team';
+      tHtml += `<div class="result-item success">
+        <div class="r-email ok">✅ ${tName}</div>
         ${r.type?`<div class="r-info">类型: ${r.type} | 过期: ${r.expired||'-'}</div>`:''}
         <div class="r-token">${r.access_token.substring(0,100)}...</div>
       </div>`;
     }
   }
-
-  el.innerHTML = html || '<div class="empty">暂无 Token</div>';
-
-  // 注册结果单独加载到注册结果区域
-  const regEl = document.getElementById('reg-results');
-  if (regEl) {
-    const codexRegs = codex.filter(r => !r.access_token && !(r._filename||'').startsWith('session-'));
-    let regHtml = '';
-    if (codexRegs.length) {
-      regHtml += '<div style="font-size:12px;color:var(--text2);margin-bottom:6px">' + codexRegs.length + ' 个注册记录</div>';
-      for (const r of codexRegs) {
-        const ok = r.registered || r.otp_validated;
-        regHtml += `<div class="result-item ${ok?'success':'fail'}">
-          <div class="r-email ${ok?'ok':'fail'}">${ok?'✅':'❌'} ${r.email||r._filename}</div>
-          ${r.registration_method?`<div class="r-info">方式: ${r.registration_method}</div>`:''}
-          ${!ok && r._raw?`<div class="r-info" style="color:var(--red)">${r._raw}</div>`:''}
-        </div>`;
-      }
-    }
-    regEl.innerHTML = regHtml || '<div class="empty">暂无注册记录</div>';
-  }
+  tEl.innerHTML = tHtml || '<div class="empty">暂无 Team Token</div>';
 }
 
 async function loadSessionResults() {
-  const codex = await api('/api/results/codex');
+  const [codex, login] = await Promise.all([
+    api('/api/results/codex'), api('/api/results/login')
+  ]);
   const el = document.getElementById('session-results');
-  const sessions = codex.filter(r => r._filename && r._filename.startsWith('session-'));
+  const sessions = [...codex, ...login].filter(r => r._filename && r._filename.startsWith('session-'));
   if (!sessions.length) {
     el.innerHTML = '<div class="empty">暂无 Session</div>';
     return;
@@ -863,10 +897,11 @@ async function loadSessionResults() {
 }
 
 async function clearFiles(type) {
-  if (!confirm('确认清除所有 ' + (type==='tokens'?'Token':'Session') + ' 文件？')) return;
+  const labels = {'tokens':'全部 Token','personal-tokens':'个人 Token','team-tokens':'Team Token','sessions':'Session'};
+  if (!confirm('确认清除所有 ' + (labels[type]||type) + ' 文件？')) return;
   const res = await api('/api/clear/' + type, {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
   alert(res.message || res.error || '完成');
-  if (type === 'tokens') loadTokenResults(); else loadSessionResults();
+  if (type === 'sessions') loadSessionResults(); else loadTokenResults();
 }
 
 async function loadFailures() {
