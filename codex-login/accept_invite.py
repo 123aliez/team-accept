@@ -255,28 +255,32 @@ def process_one(idx, total, email_addr, outlook_pwd, client_id,
         email_addr, client_id, ms_refresh_token,
         log_fn=log_fn)
 
+    accept_wid = None
+    ws_name = "Unknown"
+
     if not invite_results:
-        log_fn("未找到邀请邮件，跳过")
-        return False, email_addr, "未找到邀请邮件"
-
-    log_fn(f"找到 {len(invite_results)} 个邀请链接:")
-    for i, (link, subj) in enumerate(invite_results):
-        log_fn(f"  [{i+1}] {link}")
-        log_fn(f"       主题: {subj}")
-
-    # 解析 accept_wId (团队工作区 ID)
-    invite_url = invite_results[0][0]
-    params = _parse_invite_params(invite_url)
-    accept_wid = params.get("accept_wId") or params.get("wId")
-    ws_name = params.get("inv_ws_name") or "Unknown"
-
-    if accept_wid:
-        log_fn(f"团队工作区: {ws_name} ({accept_wid})")
+        log_fn("未找到邀请邮件, 将尝试直接获取 Team Token (可能是母号)...")
+        if search_only:
+            return False, email_addr, "未找到邀请邮件"
     else:
-        log_fn("未找到 accept_wId 参数")
+        log_fn(f"找到 {len(invite_results)} 个邀请链接:")
+        for i, (link, subj) in enumerate(invite_results):
+            log_fn(f"  [{i+1}] {link}")
+            log_fn(f"       主题: {subj}")
 
-    if search_only:
-        return True, email_addr, f"找到 {len(invite_results)} 个邀请"
+        # 解析 accept_wId (团队工作区 ID)
+        invite_url = invite_results[0][0]
+        params = _parse_invite_params(invite_url)
+        accept_wid = params.get("accept_wId") or params.get("wId")
+        ws_name = params.get("inv_ws_name") or "Unknown"
+
+        if accept_wid:
+            log_fn(f"团队工作区: {ws_name} ({accept_wid})")
+        else:
+            log_fn("未找到 accept_wId 参数")
+
+        if search_only:
+            return True, email_addr, f"找到 {len(invite_results)} 个邀请"
 
     # ── Step 2: CodexLogin 标准登录流程 ──
     log_fn("[2/4] CodexLogin 登录...")
