@@ -768,6 +768,7 @@ class CodexLogin:
         self._sentinel_token_1 = None
         self._sentinel_token_2 = None
         self._next_page_type = ""
+        self._valid_workspaces = []  # [{"ws_id": ..., "continue_url": ...}, ...]
 
     def _log(self, msg):
         _safe_print(f"[{self.tag}] {msg}")
@@ -1126,6 +1127,7 @@ class CodexLogin:
             ws_candidates.insert(0, invite_ws)
         # 去重候选列表
         ws_candidates = list(dict.fromkeys(ws_candidates))
+        self._ws_candidates = ws_candidates  # 保存供 get_all_workspace_tokens 使用
         self._log(f"  workspace 候选: {ws_candidates}")
         
         if not getattr(self, "_login_verifier", None):
@@ -1148,42 +1150,42 @@ class CodexLogin:
             except Exception as e:
                 self._log(f"  workspace/select(empty) 异常: {e}")
 
-        # 逐个尝试候选 workspace_id
-        if not getattr(self, "_login_verifier", None):
-            for ws_id in ws_candidates:
-                self._log(f"  [7b] 尝试 workspace/select({ws_id[:12]}...) ...")
-                try:
-                    r = self.session.post(
-                        f"{AUTH}/api/accounts/workspace/select",
-                        json={"workspace_id": ws_id},
-                        headers={"Content-Type": "application/json", "Accept": "application/json",
-                                 "Origin": AUTH, "User-Agent": self.fp.user_agent,
-                                 "Referer": f"{AUTH}/sign-in-with-chatgpt/codex/consent"},
-                        timeout=15, impersonate=self.fp.impersonate)
-                    self._log(f"    -> {r.status_code} ({len(r.text)} bytes)")
-                    if r.status_code == 200:
-                        self._log(f"    响应: {r.text[:600]}")
-                        m = re.search(r'login_verifier["\s:=]+([A-Za-z0-9_\-]{20,})', r.text)
-                        if m:
-                            self._login_verifier = m.group(1)
-                            self._log(f"    ✅ login_verifier 提取成功!")
-                            # 保存 continue_url (已包含 login_verifier)
-                            try:
-                                ws_data = r.json()
-                                self._continue_url = ws_data.get("continue_url", "")
-                                if self._continue_url:
-                                    self._log(f"    continue_url 已保存")
-                            except Exception:
-                                pass
-                            break
-                    elif r.status_code == 500:
-                        self._log(f"    500 跳过 (非有效 workspace)")
-                        continue
-                    else:
-                        self._log(f"    {r.text[:200]}")
-                except Exception as e:
-                    self._log(f"    异常: {e}")
-                    continue
+        # 逐个尝试候选 workspace_id，第一个成功即停止
+        for ws_id in ws_candidates:
+            self._log(f"  [7b] 尝试 workspace/select({ws_id[:12]}...) ...")
+            try:
+                r = self.session.post(
+                    f"{AUTH}/api/accounts/workspace/select",
+                    json={"workspace_id": ws_id},
+                    headers={"Content-Type": "application/json", "Accept": "application/json",
+                             "Origin": AUTH, "User-Agent": self.fp.user_agent,
+                             "Referer": f"{AUTH}/sign-in-with-chatgpt/codex/consent"},
+                    timeout=15, impersonate=self.fp.impersonate)
+                self._log(f"    -> {r.status_code} ({len(r.text)} bytes)")
+                if r.status_code == 200:
+                    self._log(f"    响应: {r.text[:600]}")
+                    m = re.search(r'login_verifier["\s:=]+([A-Za-z0-9_\-]{20,})', r.text)
+                    if m:
+                        self._login_verifier = m.group(1)
+                        self._log(f"    ✅ login_verifier 提取成功!")
+                        try:
+                            ws_data = r.json()
+                            self._continue_url = ws_data.get("continue_url", "")
+                            if self._continue_url:
+                                self._log(f"    continue_url 已保存")
+                        except Exception:
+                            pass
+                        break
+                elif r.status_code == 500:
+                    self._log(f"    500 跳过 (非有效 workspace)")
+                elif r.status_code == 409:
+                    self._log(f"    409 session 已消耗，停止尝试更多 workspace")
+                    break
+                else:
+                    self._log(f"    {r.text[:200]}")
+            except Exception as e:
+                self._log(f"    异常: {e}")
+                continue
 
         # ─── 7d: 跟随重定向获取 code ───
         self._log(f"  [7d] OAuth 重定向链...")
@@ -1219,7 +1221,23 @@ class CodexLogin:
             url = f"{AUTH}/api/oauth/oauth2/auth?{urlencode(params)}"
             self._log(f"  降级: 自行构建 URL")
 
-        # 手动跟随重定向
+        auth_code = self._follow_redirect_chain(url, headers)
+        if auth_code:
+            self._auth_code = auth_code
+            return True
+
+        self._log("  ⚠️ 未获取到 code")
+        return False
+
+    def _follow_redirect_chain(self, url, headers=None) -> str:
+        """跟随 OAuth 重定向链，返回 auth code 或 None"""
+        if not headers:
+            headers = {
+                "Accept": "text/html,*/*;q=0.8",
+                "User-Agent": self.fp.user_agent,
+                "Referer": f"{AUTH}/sign-in-with-chatgpt/codex/consent",
+            }
+
         for step in range(20):
             try:
                 r = self.session.get(
@@ -1230,11 +1248,10 @@ class CodexLogin:
                 err_msg = str(e)
                 m = re.search(r'code=([A-Za-z0-9_.\-]+)', err_msg)
                 if m:
-                    self._auth_code = m.group(1)
-                    self._log(f"  ✅ code 从异常提取: {self._auth_code[:30]}...")
-                    return True
+                    self._log(f"  ✅ code 从异常提取: {m.group(1)[:30]}...")
+                    return m.group(1)
                 self._log(f"  [{step}] 异常: {err_msg[:100]}")
-                break
+                return None
 
             if r.status_code in (301, 302, 303, 307, 308):
                 location = r.headers.get("location", "")
@@ -1244,16 +1261,14 @@ class CodexLogin:
                 if loc_p.hostname in ("localhost", "127.0.0.1"):
                     code = parse_qs(loc_p.query).get("code", [None])[0]
                     if code:
-                        self._auth_code = code
                         self._log(f"  ✅ code: {code[:30]}...")
-                        return True
-                    # 检查 error
+                        return code
                     error = parse_qs(loc_p.query).get("error", [None])[0]
                     if error:
-                        desc = parse_qs(loc_p.query).get("error_description", 
+                        desc = parse_qs(loc_p.query).get("error_description",
                                parse_qs(loc_p.query).get("error_desscription", [""]))[0]
                         self._log(f"  ⚠️ OAuth error: {error} - {desc[:100]}")
-                    return False
+                    return None
 
                 if location.startswith("/"):
                     p = urlparse(url)
@@ -1263,22 +1278,17 @@ class CodexLogin:
                 self._log(f"  [{step}] {r.status_code} (停止)")
                 break
 
-        self._log("  ⚠️ 未获取到 code")
-        return False
+        return None
 
-    # ── Step 9: Token 交换 ──
-    def step9_exchange_token(self) -> dict:
-        self._log("[Step 8] Token 交换...")
-        if not self._auth_code:
-            return None
+    def _exchange_token_for_code(self, auth_code: str) -> dict:
+        """用 auth code 交换 token"""
         body = {
             "grant_type": "authorization_code",
-            "code": self._auth_code,
+            "code": auth_code,
             "client_id": CODEX_CLIENT_ID,
             "redirect_uri": CODEX_REDIRECT_URI,
             "code_verifier": self.code_verifier,
         }
-        # CLIProxyAPI 确认: TokenURL = "https://auth.openai.com/oauth/token"
         r = self.session.post(
             f"{AUTH}/oauth/token",
             data=urlencode(body),
@@ -1286,11 +1296,153 @@ class CodexLogin:
                      "Accept": "application/json", "Origin": AUTH,
                      "User-Agent": self.fp.user_agent},
             timeout=30, impersonate=self.fp.impersonate)
-        self._log(f"  token exchange -> {r.status_code}")
         if r.status_code != 200:
-            self._log(f"  ⚠️ 失败: {r.text[:500]}")
+            self._log(f"  ⚠️ token 交换失败: {r.text[:300]}")
             return None
         return r.json()
+
+    def _fetch_workspace_candidates(self) -> list:
+        """从 consent 页面提取 workspace 候选列表"""
+        consent_url = getattr(self, "_consent_url", "") or ""
+        if "add-phone" in consent_url:
+            consent_url = f"{AUTH}/sign-in-with-chatgpt/codex/consent"
+        if not consent_url:
+            consent_url = f"{AUTH}/sign-in-with-chatgpt/codex/consent"
+
+        ws_candidates = []
+        try:
+            r = self.session.get(
+                consent_url,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                    "User-Agent": self.fp.user_agent,
+                    "Referer": f"{AUTH}/email-verification",
+                },
+                timeout=30, impersonate=self.fp.impersonate)
+            self._log(f"  consent 页面 -> {r.status_code}, {len(r.text)} bytes")
+            body = r.text
+
+            # 从 script 标签提取 workspace_id
+            scripts = re.findall(r'<script[^>]*>(.*?)</script>', body, re.DOTALL)
+            for script in scripts:
+                script = script.strip()
+                if not script or script.startswith('//'):
+                    continue
+                json_match = re.search(r'(?:window\.__\w+__|__NEXT_DATA__)\s*=\s*({.*})', script, re.DOTALL)
+                if json_match:
+                    try:
+                        data = json.loads(json_match.group(1))
+                        raw = json.dumps(data)
+                        ws_ids = re.findall(r'"workspace_id"\s*:\s*"([^"]+)"', raw)
+                        ws_candidates.extend(ws_ids)
+                    except json.JSONDecodeError:
+                        pass
+
+            # 直接搜索 workspace_id
+            ws_candidates.extend(re.findall(r'"workspace_id"\s*:\s*"([^"]+)"', body))
+            # organization_id
+            ws_candidates.extend(re.findall(r'"organization_id"\s*:\s*"([^"]+)"', body))
+            # 所有 UUIDs
+            all_uuids = re.findall(
+                r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', body)
+            ws_candidates.extend(all_uuids)
+        except Exception as e:
+            self._log(f"  consent 页面异常: {e}")
+
+        # 去重
+        ws_candidates = list(dict.fromkeys(ws_candidates))
+        self._log(f"  workspace 候选 ({len(ws_candidates)}): {[c[:12] for c in ws_candidates]}")
+        return ws_candidates
+
+    def get_all_workspace_tokens(self, ws_candidates: list = None) -> list:
+        """
+        遍历所有 workspace 候选，逐个 select + redirect + exchange 获取 token。
+        每处理一个 workspace 后 session 被消耗，所以只能取到第一个有效的 token。
+
+        Args:
+            ws_candidates: workspace_id 列表。如果为 None 则自动从 consent 页面提取。
+        Returns:
+            [{"ws_id": ..., "plan": "free"|"team"|..., "token": {...}}, ...]
+        """
+        results = []
+        headers = {
+            "Content-Type": "application/json", "Accept": "application/json",
+            "Origin": AUTH, "User-Agent": self.fp.user_agent,
+            "Referer": f"{AUTH}/sign-in-with-chatgpt/codex/consent",
+        }
+        redirect_headers = {
+            "Accept": "text/html,*/*;q=0.8",
+            "User-Agent": self.fp.user_agent,
+            "Referer": f"{AUTH}/sign-in-with-chatgpt/codex/consent",
+        }
+
+        # 如果没有传入候选列表，从 consent 页面自动提取
+        if ws_candidates is None:
+            ws_candidates = self._fetch_workspace_candidates()
+            # 反转顺序: personal workspace 通常排在 team 后面，反转后优先尝试 personal
+            ws_candidates = list(reversed(ws_candidates))
+
+        for i, ws_id in enumerate(ws_candidates):
+            self._log(f"  [多Token {i+1}/{len(ws_candidates)}] workspace {ws_id[:12]}...")
+
+            # 1. workspace/select
+            try:
+                r = self.session.post(
+                    f"{AUTH}/api/accounts/workspace/select",
+                    json={"workspace_id": ws_id},
+                    headers=headers,
+                    timeout=15, impersonate=self.fp.impersonate)
+                self._log(f"    select -> {r.status_code}")
+                if r.status_code == 409:
+                    self._log(f"    session 已消耗，停止")
+                    break
+                if r.status_code != 200:
+                    self._log(f"    跳过 ({r.status_code})")
+                    continue
+                m = re.search(r'login_verifier["\s:=]+([A-Za-z0-9_\-]{20,})', r.text)
+                if not m:
+                    self._log(f"    跳过 (无 login_verifier)")
+                    continue
+                try:
+                    c_url = r.json().get("continue_url", "")
+                except Exception:
+                    c_url = ""
+                if not c_url:
+                    self._log(f"    跳过 (无 continue_url)")
+                    continue
+            except Exception as e:
+                self._log(f"    异常: {e}")
+                continue
+
+            # 2. 跟随重定向获取 auth code
+            auth_code = self._follow_redirect_chain(c_url, redirect_headers)
+            if not auth_code:
+                self._log(f"    跳过 (未获取 auth code)")
+                continue
+
+            # 3. 交换 token
+            token_data = self._exchange_token_for_code(auth_code)
+            if not token_data:
+                self._log(f"    跳过 (token 交换失败)")
+                continue
+
+            # 4. 解析 plan_type
+            output = self._build_output(token_data)
+            payload = decode_jwt_payload(output.get("access_token", ""))
+            auth_info = payload.get("https://api.openai.com/auth", {})
+            plan = auth_info.get("chatgpt_plan_type", "free")
+
+            self._log(f"    ✅ plan={plan}, account={auth_info.get('chatgpt_account_id', '')[:12]}...")
+            results.append({"ws_id": ws_id, "plan": plan, "token": output})
+
+        return results
+
+    # ── Step 9: Token 交换 (保留向后兼容) ──
+    def step9_exchange_token(self) -> dict:
+        self._log("[Step 8] Token 交换...")
+        if not self._auth_code:
+            return None
+        return self._exchange_token_for_code(self._auth_code)
 
     # ── 主流程 ──
     def run(self, otp_fn=None, password: str = None) -> dict:

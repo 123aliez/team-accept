@@ -35,6 +35,19 @@ from codex_login import (
 )
 
 
+def _save_token_file(out_dir, email_addr, plan, token_output):
+    """根据 plan_type 保存 token 文件，返回文件路径"""
+    if plan == "team":
+        fname = f"codex-{email_addr}-team.json"
+    else:
+        fname = f"token-{email_addr}.json"
+    path = os.path.join(out_dir, fname)
+    with _file_lock:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(token_output, f, ensure_ascii=False, indent=2)
+    return path
+
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -396,41 +409,39 @@ def process_one_login(idx, total, email_addr, outlook_pwd, client_id, ms_refresh
         login.step6b_about_you()
         login._delay(0.5, 1.5)
 
-        # 获取 auth code
-        if not login.step7_get_auth_code():
-            return False, email_addr, "获取 auth code 失败"
+        # 直接用 get_all_workspace_tokens 逐个尝试所有 workspace
+        all_tokens = login.get_all_workspace_tokens()
+        if not all_tokens:
+            return False, email_addr, "所有 workspace 均未获取到 token"
 
-        # Token 交换
-        token_data = login.step9_exchange_token()
-        if not token_data:
-            return False, email_addr, "token 交换失败"
-
-        token_output = login._build_output(token_data)
         out_dir = os.path.join(SCRIPT_DIR, "output")
         os.makedirs(out_dir, exist_ok=True)
 
-        token_path = os.path.join(out_dir, f"token-{email_addr}.json")
-        with _file_lock:
-            with open(token_path, "w", encoding="utf-8") as f:
-                json.dump(token_output, f, ensure_ascii=False, indent=2)
-        log_fn(f"✅ Token 获取成功 → {token_path}")
+        saved_plans = []
+        for ws_result in all_tokens:
+            plan = ws_result["plan"]
+            token_output = ws_result["token"]
+            token_path = _save_token_file(out_dir, email_addr, plan, token_output)
+            log_fn(f"✅ Token ({plan}) → {token_path}")
+            saved_plans.append(plan)
 
-        # 获取 ChatGPT session
-        if fetch_session:
-            try:
-                session_data = login.fetch_chatgpt_session(token_data.get("access_token", ""))
-                if session_data:
-                    session_path = os.path.join(out_dir, f"session-{email_addr}.json")
-                    with _file_lock:
-                        with open(session_path, "w", encoding="utf-8") as f:
-                            json.dump(session_data, f, ensure_ascii=False, indent=2)
-                    log_fn(f"✅ Session 导出成功 → {session_path}")
-                else:
-                    log_fn("⚠️ Session 获取失败")
-            except Exception as se:
-                log_fn(f"⚠️ Session 获取异常: {se}")
+            # 获取 ChatGPT session
+            if fetch_session:
+                try:
+                    session_data = login.fetch_chatgpt_session(token_output.get("access_token", ""))
+                    if session_data:
+                        suffix = f"-{plan}" if plan == "team" else ""
+                        session_path = os.path.join(out_dir, f"session-{email_addr}{suffix}.json")
+                        with _file_lock:
+                            with open(session_path, "w", encoding="utf-8") as f:
+                                json.dump(session_data, f, ensure_ascii=False, indent=2)
+                        log_fn(f"✅ Session ({plan}) → {session_path}")
+                    else:
+                        log_fn(f"⚠️ Session ({plan}) 获取失败")
+                except Exception as se:
+                    log_fn(f"⚠️ Session ({plan}) 异常: {se}")
 
-        return True, email_addr, "登录成功 + Token 已获取"
+        return True, email_addr, f"登录成功 + Token: {', '.join(saved_plans)}"
     except Exception as e:
         log_fn(f"异常: {e}")
         traceback.print_exc()
