@@ -67,7 +67,7 @@ def _password_relogin(login, password, log_fn):
     """
     add-phone 绕过: 清 cookie 重新走 OAuth + 密码登录。
     参考项目验证过的方案：密码登录不触发 add-phone。
-    成功返回 (token_data, code_verifier, state)，失败返回 None。
+    成功返回 {"ws_id": ..., "plan": ..., "token": {...}}，失败返回 None。
     """
     import time
 
@@ -80,6 +80,9 @@ def _password_relogin(login, password, log_fn):
     code_verifier, code_challenge = generate_pkce()
     import secrets as _secrets
     state = _secrets.token_urlsafe(24)
+    login.code_verifier = code_verifier
+    login.code_challenge = code_challenge
+    login.state = state
 
     # 1. OAuth init
     log_fn("  [pwd-relogin] OAuth init...")
@@ -178,139 +181,15 @@ def _password_relogin(login, password, log_fn):
     except Exception:
         pass
 
-    # 5. 从 cookie 提取 workspace_id
-    auth_cookie = login.session.cookies.get("oai-client-auth-session") or ""
-    if not auth_cookie:
-        log_fn("    ⚠️ cookie 中无 oai-client-auth-session")
+    login._consent_url = f"{AUTH}/sign-in-with-chatgpt/codex/consent"
+    log_fn("  [pwd-relogin] 获取 personal workspace token...")
+    result = login.get_personal_workspace_token()
+    if not result:
+        log_fn("    ⚠️ 该账号无 personal workspace 或 personal token 获取失败")
         return None
 
-    workspace_id = ""
-    for part in auth_cookie.split("."):
-        decoded = _decode_jwt_segment(part)
-        if isinstance(decoded, dict) and "workspaces" in decoded:
-            workspaces = decoded.get("workspaces") or []
-            if workspaces:
-                workspace_id = str((workspaces[0] or {}).get("id") or "").strip()
-            break
-
-    if not workspace_id:
-        log_fn("    ⚠️ cookie 中无 workspace 信息")
-        return None
-
-    log_fn(f"    workspace_id: {workspace_id}")
-
-    # 6. workspace/select
-    log_fn("  [pwd-relogin] workspace/select...")
-    r = login.session.post(
-        f"{AUTH}/api/accounts/workspace/select",
-        json={"workspace_id": workspace_id},
-        headers={
-            "Content-Type": "application/json",
-            "Referer": f"{AUTH}/sign-in-with-chatgpt/codex/consent",
-            "User-Agent": login.fp.user_agent,
-        },
-        timeout=30, impersonate=login.fp.impersonate)
-    log_fn(f"    workspace/select -> {r.status_code}")
-
-    if r.status_code != 200:
-        log_fn(f"    ⚠️ workspace/select 失败: {r.text[:300]}")
-        return None
-
-    try:
-        ws_data = r.json()
-        continue_url = ws_data.get("continue_url", "")
-    except Exception:
-        continue_url = ""
-
-    if not continue_url:
-        log_fn("    ⚠️ 无 continue_url")
-        return None
-
-    log_fn(f"    continue_url 获取成功")
-
-    # 7. 重定向链获取 code
-    log_fn("  [pwd-relogin] 重定向链...")
-    current_url = continue_url
-    auth_code = ""
-    for i in range(15):
-        r = login.session.get(
-            current_url, allow_redirects=False,
-            headers={"User-Agent": login.fp.user_agent},
-            timeout=15, impersonate=login.fp.impersonate)
-
-        if r.status_code in (301, 302, 303, 307, 308):
-            next_url = r.headers.get("Location", "")
-            if next_url and not next_url.startswith("http"):
-                p = urlparse(current_url)
-                next_url = f"{p.scheme}://{p.netloc}{next_url}"
-        elif r.status_code == 200:
-            # consent 页面需要 POST accept
-            if "consent_challenge=" in current_url:
-                cr = login.session.post(
-                    current_url, data={"action": "accept"},
-                    allow_redirects=False,
-                    headers={"User-Agent": login.fp.user_agent},
-                    timeout=15, impersonate=login.fp.impersonate)
-                next_url = cr.headers.get("Location", "") if cr.status_code in (301, 302, 303, 307, 308) else ""
-                if next_url and not next_url.startswith("http"):
-                    p = urlparse(current_url)
-                    next_url = f"{p.scheme}://{p.netloc}{next_url}"
-            else:
-                # meta refresh
-                meta = re.search(r'content=["\']?\d+;\s*url=([^"\'>\s]+)', r.text, re.IGNORECASE)
-                next_url = meta.group(1) if meta else ""
-            if not next_url:
-                break
-        else:
-            log_fn(f"    重定向 [{i}] 异常: {r.status_code}")
-            break
-
-        # 检查是否拿到 code
-        if "code=" in next_url and "state=" in next_url:
-            parsed = urlparse(next_url)
-            qs = parse_qs(parsed.query)
-            auth_code = qs.get("code", [""])[0]
-            log_fn(f"    ✅ 拿到 auth code!")
-            break
-
-        current_url = next_url
-        time.sleep(0.3)
-
-    if not auth_code:
-        log_fn("    ⚠️ 重定向链中未找到 code")
-        return None
-
-    # 8. Token 交换
-    log_fn("  [pwd-relogin] Token 交换...")
-    r = login.session.post(
-        f"{AUTH}/api/oauth/token",
-        json={
-            "grant_type": "authorization_code",
-            "client_id": CODEX_CLIENT_ID,
-            "code": auth_code,
-            "redirect_uri": CODEX_REDIRECT_URI,
-            "code_verifier": code_verifier,
-        },
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Origin": AUTH,
-            "User-Agent": login.fp.user_agent,
-        },
-        timeout=30, impersonate=login.fp.impersonate)
-    log_fn(f"    token -> {r.status_code}")
-
-    if r.status_code != 200:
-        log_fn(f"    ⚠️ token 交换失败: {r.text[:300]}")
-        return None
-
-    try:
-        token_data = r.json()
-        log_fn(f"    ✅ Token 获取成功! keys: {list(token_data.keys())}")
-        return token_data
-    except Exception as e:
-        log_fn(f"    ⚠️ 解析 token 响应失败: {e}")
-        return None
+    log_fn(f"    ✅ Token 获取成功! plan={result['plan']}")
+    return result
 
 
 def process_one_login(idx, total, email_addr, outlook_pwd, client_id, ms_refresh_token, proxy, fetch_session=True):
@@ -375,22 +254,20 @@ def process_one_login(idx, total, email_addr, outlook_pwd, client_id, ms_refresh
         # ── add-phone 检测: 用密码重登录绕过 ──
         if "add-phone" in consent_url:
             log_fn("检测到 add-phone，切换密码重登录绕过...")
-            token_data = _password_relogin(login, password, log_fn)
-            if token_data:
+            ws_result = _password_relogin(login, password, log_fn)
+            if ws_result:
                 # 密码重登录成功，直接保存 token
-                token_output = login._build_output(token_data)
+                plan = ws_result["plan"]
+                token_output = ws_result["token"]
                 out_dir = os.path.join(SCRIPT_DIR, "output")
                 os.makedirs(out_dir, exist_ok=True)
 
-                token_path = os.path.join(out_dir, f"token-{email_addr}.json")
-                with _file_lock:
-                    with open(token_path, "w", encoding="utf-8") as f:
-                        json.dump(token_output, f, ensure_ascii=False, indent=2)
-                log_fn(f"✅ Token 获取成功 (密码重登录) → {token_path}")
+                token_path = _save_token_file(out_dir, email_addr, plan, token_output)
+                log_fn(f"✅ Token 获取成功 (密码重登录, {plan}) → {token_path}")
 
                 if fetch_session:
                     try:
-                        session_data = login.fetch_chatgpt_session(token_data.get("access_token", ""))
+                        session_data = login.fetch_chatgpt_session(token_output.get("access_token", ""))
                         if session_data:
                             session_path = os.path.join(out_dir, f"session-{email_addr}.json")
                             with _file_lock:
@@ -402,46 +279,40 @@ def process_one_login(idx, total, email_addr, outlook_pwd, client_id, ms_refresh
                     except Exception as se:
                         log_fn(f"⚠️ Session 获取异常: {se}")
 
-                return True, email_addr, "登录成功 (密码重登录绕过 add-phone)"
+                return True, email_addr, f"登录成功 (密码重登录绕过 add-phone, {plan})"
             else:
-                return False, email_addr, "add-phone 绕过失败"
+                return False, email_addr, "add-phone 绕过失败或该账号无 personal workspace"
 
         login.step6b_about_you()
         login._delay(0.5, 1.5)
 
-        # 直接用 get_all_workspace_tokens 逐个尝试所有 workspace
-        all_tokens = login.get_all_workspace_tokens()
-        if not all_tokens:
-            return False, email_addr, "所有 workspace 均未获取到 token"
+        ws_result = login.get_personal_workspace_token()
+        if not ws_result:
+            return False, email_addr, "该账号无 personal workspace"
 
         out_dir = os.path.join(SCRIPT_DIR, "output")
         os.makedirs(out_dir, exist_ok=True)
 
-        saved_plans = []
-        for ws_result in all_tokens:
-            plan = ws_result["plan"]
-            token_output = ws_result["token"]
-            token_path = _save_token_file(out_dir, email_addr, plan, token_output)
-            log_fn(f"✅ Token ({plan}) → {token_path}")
-            saved_plans.append(plan)
+        plan = ws_result["plan"]
+        token_output = ws_result["token"]
+        token_path = _save_token_file(out_dir, email_addr, plan, token_output)
+        log_fn(f"✅ Token ({plan}) → {token_path}")
 
-            # 获取 ChatGPT session
-            if fetch_session:
-                try:
-                    session_data = login.fetch_chatgpt_session(token_output.get("access_token", ""))
-                    if session_data:
-                        suffix = f"-{plan}" if plan == "team" else ""
-                        session_path = os.path.join(out_dir, f"session-{email_addr}{suffix}.json")
-                        with _file_lock:
-                            with open(session_path, "w", encoding="utf-8") as f:
-                                json.dump(session_data, f, ensure_ascii=False, indent=2)
-                        log_fn(f"✅ Session ({plan}) → {session_path}")
-                    else:
-                        log_fn(f"⚠️ Session ({plan}) 获取失败")
-                except Exception as se:
-                    log_fn(f"⚠️ Session ({plan}) 异常: {se}")
+        if fetch_session:
+            try:
+                session_data = login.fetch_chatgpt_session(token_output.get("access_token", ""))
+                if session_data:
+                    session_path = os.path.join(out_dir, f"session-{email_addr}.json")
+                    with _file_lock:
+                        with open(session_path, "w", encoding="utf-8") as f:
+                            json.dump(session_data, f, ensure_ascii=False, indent=2)
+                    log_fn(f"✅ Session ({plan}) → {session_path}")
+                else:
+                    log_fn(f"⚠️ Session ({plan}) 获取失败")
+            except Exception as se:
+                log_fn(f"⚠️ Session ({plan}) 异常: {se}")
 
-        return True, email_addr, f"登录成功 + Token: {', '.join(saved_plans)}"
+        return True, email_addr, f"登录成功 + Token: {plan}"
     except Exception as e:
         log_fn(f"异常: {e}")
         traceback.print_exc()
